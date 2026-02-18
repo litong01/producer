@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Audio → MusicXML Transcriber</title>
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<title>Media Transcriber</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -66,11 +67,20 @@
     align-items: center;
   }
   .file-info.visible { display: flex; }
+  .file-names-list {
+    margin-top: 6px;
+    font-size: 0.8rem;
+    color: #8b949e;
+    max-height: 80px;
+    overflow-y: auto;
+    word-break: break-all;
+  }
   .file-info .remove {
     color: #f85149;
     cursor: pointer;
     font-size: 0.8rem;
     margin-left: 12px;
+    white-space: nowrap;
   }
 
   /* Stem selector */
@@ -192,23 +202,25 @@
 </head>
 <body>
 <div class="container">
-  <h1>Audio / Video → MusicXML</h1>
-  <p class="subtitle">Upload a file, get a melody transcription as MusicXML + MIDI.</p>
+  <h1>Media Transcriber</h1>
+  <p class="subtitle">Upload audio/video for melody transcription, or images/PDF for score extraction.</p>
 
   <div class="dropzone" id="dropzone">
-    <p>Drag &amp; drop your audio or video file here</p>
+    <p>Drag &amp; drop files here</p>
     <p>or <span class="browse" id="browse">browse</span></p>
-    <input type="file" id="fileInput"
-      accept=".mp3,.wav,.flac,.ogg,.m4a,.aac,.wma,.mp4,.mkv,.mov,.avi,.webm">
+    <input type="file" id="fileInput" multiple>
   </div>
 
   <div class="file-info" id="fileInfo">
-    <span id="fileName"></span>
-    <span class="remove" id="removeFile">Remove</span>
+    <div>
+      <span id="fileName"></span>
+      <div id="fileNamesList" class="file-names-list"></div>
+    </div>
+    <span class="remove" id="removeFile">Clear</span>
   </div>
 
-  <div class="stem-group">
-    <label for="stemSelect">What to extract</label>
+  <div class="stem-group" id="stemGroup">
+    <label for="stemSelect">What to extract (audio/video only)</label>
     <select id="stemSelect">
       <option value="auto">Auto — vocals + lead instrument</option>
       <option value="vocals">Vocals only</option>
@@ -218,7 +230,7 @@
     </select>
   </div>
 
-  <button class="start" id="startBtn" disabled>Start Transcription</button>
+  <button class="start" id="startBtn" disabled>Start Processing</button>
 
   <div class="progress-section" id="progressSection">
     <div class="step-label" id="stepLabel">Waiting…</div>
@@ -231,36 +243,49 @@
 
   <div class="downloads" id="downloads">
     <h2>Downloads</h2>
-    <a id="dlXml" href="#">
-      <span class="label">melody.musicxml</span>
-      <span class="desc">— open in MuseScore / Dorico</span>
-    </a>
-    <a id="dlMidi" href="#">
-      <span class="label">melody.mid</span>
-      <span class="desc">— MIDI file</span>
-    </a>
-    <a id="dlMeta" href="#">
-      <span class="label">metadata.json</span>
-      <span class="desc">— tempo, duration, etc.</span>
-    </a>
+    <div id="downloadLinks"></div>
   </div>
 </div>
 
 <script>
 (function () {
-  const dropzone = document.getElementById("dropzone");
-  const fileInput = document.getElementById("fileInput");
-  const fileInfo = document.getElementById("fileInfo");
-  const fileName = document.getElementById("fileName");
-  const removeFile = document.getElementById("removeFile");
-  const startBtn = document.getElementById("startBtn");
-  const progressSection = document.getElementById("progressSection");
-  const stepLabel = document.getElementById("stepLabel");
-  const progressFill = document.getElementById("progressFill");
-  const errorMsg = document.getElementById("errorMsg");
-  const downloads = document.getElementById("downloads");
+  var dropzone = document.getElementById("dropzone");
+  var fileInput = document.getElementById("fileInput");
+  var fileInfo = document.getElementById("fileInfo");
+  var fileName = document.getElementById("fileName");
+  var removeFile = document.getElementById("removeFile");
+  var stemGroup = document.getElementById("stemGroup");
+  var startBtn = document.getElementById("startBtn");
+  var progressSection = document.getElementById("progressSection");
+  var stepLabel = document.getElementById("stepLabel");
+  var progressFill = document.getElementById("progressFill");
+  var errorMsg = document.getElementById("errorMsg");
+  var downloads = document.getElementById("downloads");
+  var downloadLinks = document.getElementById("downloadLinks");
 
-  let selectedFile = null;
+  var imageExts = [".jpg",".jpeg",".png",".bmp",".tiff",".tif",".gif",".webp",".heic",".heif"];
+  var selectedFiles = [];
+
+  function isImage(name) {
+    var ext = name.substring(name.lastIndexOf(".")).toLowerCase();
+    return imageExts.indexOf(ext) !== -1;
+  }
+
+  function isPdf(name) {
+    return name.toLowerCase().endsWith(".pdf");
+  }
+
+  function isDocument(name) {
+    return isImage(name) || isPdf(name);
+  }
+
+  function allDocuments() {
+    if (selectedFiles.length === 0) return false;
+    for (var i = 0; i < selectedFiles.length; i++) {
+      if (!isDocument(selectedFiles[i].name)) return false;
+    }
+    return true;
+  }
 
   // --- Drag & drop ---
   dropzone.addEventListener("dragover", function (e) {
@@ -273,7 +298,7 @@
   dropzone.addEventListener("drop", function (e) {
     e.preventDefault();
     dropzone.classList.remove("dragover");
-    if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]);
+    if (e.dataTransfer.files.length) setFiles(e.dataTransfer.files);
   });
   dropzone.addEventListener("click", function () { fileInput.click(); });
   document.getElementById("browse").addEventListener("click", function (e) {
@@ -281,24 +306,57 @@
     fileInput.click();
   });
   fileInput.addEventListener("change", function () {
-    if (fileInput.files.length) setFile(fileInput.files[0]);
+    // Some browsers (e.g. Safari with HEIC) populate fileInput.files asynchronously.
+    function trySetFiles() {
+      var files = fileInput.files;
+      if (files && files.length > 0) {
+        setFiles(files);
+        return;
+      }
+      setTimeout(function () {
+        files = fileInput.files;
+        if (files && files.length > 0) {
+          setFiles(files);
+        } else {
+          errorMsg.textContent = "No files were added. Try dragging and dropping your files onto the box instead.";
+          errorMsg.classList.add("visible");
+        }
+      }, 100);
+    }
+    trySetFiles();
   });
-  removeFile.addEventListener("click", clearFile);
+  removeFile.addEventListener("click", clearFiles);
 
-  function setFile(f) {
-    selectedFile = f;
-    fileName.textContent = f.name + " (" + formatSize(f.size) + ")";
+  function setFiles(fileList) {
+    selectedFiles = Array.prototype.slice.call(fileList);
+    var total = 0;
+    for (var i = 0; i < selectedFiles.length; i++) total += selectedFiles[i].size;
+    if (selectedFiles.length === 1) {
+      fileName.textContent = selectedFiles[0].name + " (" + formatSize(total) + ")";
+    } else {
+      fileName.textContent = selectedFiles.length + " files (" + formatSize(total) + ")";
+    }
+    var listEl = document.getElementById("fileNamesList");
+    listEl.innerHTML = "";
+    if (selectedFiles.length > 0) {
+      var names = [];
+      for (var i = 0; i < selectedFiles.length; i++) names.push(selectedFiles[i].name);
+      listEl.textContent = names.join(", ");
+    }
     fileInfo.classList.add("visible");
     startBtn.disabled = false;
     errorMsg.classList.remove("visible");
     downloads.classList.remove("visible");
+    stemGroup.style.display = allDocuments() ? "none" : "";
   }
 
-  function clearFile() {
-    selectedFile = null;
+  function clearFiles() {
+    selectedFiles = [];
     fileInput.value = "";
+    document.getElementById("fileNamesList").textContent = "";
     fileInfo.classList.remove("visible");
     startBtn.disabled = true;
+    stemGroup.style.display = "";
   }
 
   function formatSize(bytes) {
@@ -309,7 +367,7 @@
 
   // --- Upload & poll ---
   startBtn.addEventListener("click", function () {
-    if (!selectedFile) return;
+    if (!selectedFiles.length) return;
     startBtn.disabled = true;
     progressSection.classList.add("visible");
     errorMsg.classList.remove("visible");
@@ -318,19 +376,21 @@
     progressFill.style.width = "2%";
 
     var form = new FormData();
-    form.append("file", selectedFile);
+    for (var i = 0; i < selectedFiles.length; i++) {
+      form.append("file", selectedFiles[i]);
+    }
     form.append("stem", document.getElementById("stemSelect").value);
 
     fetch("/upload", { method: "POST", body: form })
       .then(function (r) { return r.json(); })
       .then(function (data) {
         if (data.error) throw new Error(data.error);
-        pollStatus(data.job_id);
+        pollStatus(data.job_id, data.base_name, data.mode);
       })
       .catch(showError);
   });
 
-  function pollStatus(jobId) {
+  function pollStatus(jobId, baseName, mode) {
     var interval = setInterval(function () {
       fetch("/status?job_id=" + jobId)
         .then(function (r) { return r.json(); })
@@ -345,21 +405,50 @@
 
           if (data.status === "done") {
             clearInterval(interval);
-            showDownloads(jobId);
+            showDownloads(jobId, data.output_files, data.message);
           }
         })
         .catch(function () { /* retry silently */ });
     }, 1000);
   }
 
-  function showDownloads(jobId) {
+  var FILE_DESCRIPTIONS = {
+    ".musicxml": "open in MuseScore / Dorico",
+    ".mid":      "MIDI file",
+    ".json":     "tempo, duration, etc.",
+    ".pdf":      "searchable PDF with OCR",
+  };
+
+  function showDownloads(jobId, outputFiles, message) {
+    downloadLinks.innerHTML = "";
+    if (message) {
+      var p = document.createElement("p");
+      p.className = "download-message";
+      p.textContent = message;
+      p.style.cssText = "margin-bottom:12px;padding:10px;background:#1c2128;border-radius:8px;font-size:0.85rem;color:#8b949e;";
+      downloadLinks.appendChild(p);
+    }
     var base = "/download/" + jobId + "/";
-    document.getElementById("dlXml").href = base + "melody.musicxml";
-    document.getElementById("dlMidi").href = base + "melody.mid";
-    document.getElementById("dlMeta").href = base + "metadata.json";
+
+    (outputFiles || []).forEach(function (fname) {
+      var ext = fname.substring(fname.lastIndexOf(".")).toLowerCase();
+      var desc = FILE_DESCRIPTIONS[ext] || "";
+      var a = document.createElement("a");
+      a.href = base + encodeURIComponent(fname);
+      a.innerHTML = '<span class="label">' + escHtml(fname) + '</span>' +
+                    (desc ? '<span class="desc">— ' + escHtml(desc) + '</span>' : '');
+      downloadLinks.appendChild(a);
+    });
+
     downloads.classList.add("visible");
     startBtn.disabled = false;
-    stepLabel.textContent = "Transcription complete";
+    stepLabel.textContent = "Processing complete";
+  }
+
+  function escHtml(s) {
+    var d = document.createElement("div");
+    d.textContent = s;
+    return d.innerHTML;
   }
 
   function showError(err) {
