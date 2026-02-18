@@ -73,8 +73,38 @@
     margin-left: 12px;
   }
 
+  /* Stem selector */
+  .stem-group {
+    margin-top: 16px;
+  }
+  .stem-group label {
+    display: block;
+    font-size: 0.82rem;
+    color: #8b949e;
+    margin-bottom: 6px;
+  }
+  .stem-group select {
+    width: 100%;
+    padding: 10px 12px;
+    font-size: 0.9rem;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    background: #161b22;
+    color: #c9d1d9;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg width='10' height='6' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%238b949e'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+    cursor: pointer;
+  }
+  .stem-group select:focus {
+    outline: none;
+    border-color: #58a6ff;
+  }
+
   button.start {
-    margin-top: 20px;
+    margin-top: 16px;
     width: 100%;
     padding: 14px;
     font-size: 1rem;
@@ -175,6 +205,17 @@
   <div class="file-info" id="fileInfo">
     <span id="fileName"></span>
     <span class="remove" id="removeFile">Remove</span>
+  </div>
+
+  <div class="stem-group">
+    <label for="stemSelect">What to extract</label>
+    <select id="stemSelect">
+      <option value="auto">Auto — vocals + lead instrument</option>
+      <option value="vocals">Vocals only</option>
+      <option value="instrument">Lead instrument only (no vocals)</option>
+      <option value="bass">Bass line</option>
+      <option value="full">Full mix (skip separation — use for solo recordings)</option>
+    </select>
   </div>
 
   <button class="start" id="startBtn" disabled>Start Transcription</button>
@@ -278,6 +319,7 @@
 
     var form = new FormData();
     form.append("file", selectedFile);
+    form.append("stem", document.getElementById("stemSelect").value);
 
     fetch("/upload", { method: "POST", body: form })
       .then(function (r) { return r.json(); })

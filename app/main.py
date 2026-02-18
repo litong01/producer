@@ -39,6 +39,8 @@ def upload():
     if ext not in ALLOWED_EXTENSIONS:
         return jsonify(error=f"Unsupported file type: {ext}"), 400
 
+    stem = request.form.get("stem", "auto")
+
     job_id = uuid.uuid4().hex[:12]
     job_dir = OUTPUT_ROOT / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -48,7 +50,10 @@ def upload():
     with _lock:
         _jobs[job_id] = {"status": "queued", "step": "", "progress": 0, "error": None}
 
-    t = threading.Thread(target=_run_job, args=(job_id, str(input_path), str(job_dir)))
+    t = threading.Thread(
+        target=_run_job,
+        args=(job_id, str(input_path), str(job_dir), stem),
+    )
     t.daemon = True
     t.start()
 
@@ -77,7 +82,7 @@ def download(job_id, filename):
     return send_from_directory(str(job_dir), filename, as_attachment=True)
 
 
-def _run_job(job_id: str, input_path: str, work_dir: str):
+def _run_job(job_id: str, input_path: str, work_dir: str, stem: str):
     def on_progress(step, pct):
         with _lock:
             _jobs[job_id].update(status="processing", step=step, progress=pct)
@@ -85,7 +90,7 @@ def _run_job(job_id: str, input_path: str, work_dir: str):
     try:
         with _lock:
             _jobs[job_id]["status"] = "processing"
-        run_pipeline(input_path, work_dir, on_progress=on_progress)
+        run_pipeline(input_path, work_dir, stem=stem, on_progress=on_progress)
         with _lock:
             _jobs[job_id].update(status="done", progress=100, step="Done")
     except Exception as e:
