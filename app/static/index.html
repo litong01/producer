@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
-<title>Media Transcriber</title>
+<title>PDF &amp; Score Extractor</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -81,36 +81,6 @@
     font-size: 0.8rem;
     margin-left: 12px;
     white-space: nowrap;
-  }
-
-  /* Stem selector */
-  .stem-group {
-    margin-top: 16px;
-  }
-  .stem-group label {
-    display: block;
-    font-size: 0.82rem;
-    color: #8b949e;
-    margin-bottom: 6px;
-  }
-  .stem-group select {
-    width: 100%;
-    padding: 10px 12px;
-    font-size: 0.9rem;
-    border: 1px solid #30363d;
-    border-radius: 8px;
-    background: #161b22;
-    color: #c9d1d9;
-    appearance: none;
-    -webkit-appearance: none;
-    background-image: url("data:image/svg+xml,%3Csvg width='10' height='6' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%238b949e'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 12px center;
-    cursor: pointer;
-  }
-  .stem-group select:focus {
-    outline: none;
-    border-color: #58a6ff;
   }
 
   button.start {
@@ -202,8 +172,8 @@
 </head>
 <body>
 <div class="container">
-  <h1>Media Transcriber</h1>
-  <p class="subtitle">Upload audio/video for melody transcription, or images/PDF for score extraction.</p>
+  <h1>PDF &amp; Score Extractor</h1>
+  <p class="subtitle">Upload images or a PDF to generate a PDF and extract scores to MusicXML.</p>
 
   <div class="dropzone" id="dropzone">
     <p>Drag &amp; drop files here</p>
@@ -217,17 +187,6 @@
       <div id="fileNamesList" class="file-names-list"></div>
     </div>
     <span class="remove" id="removeFile">Clear</span>
-  </div>
-
-  <div class="stem-group" id="stemGroup">
-    <label for="stemSelect">What to extract (audio/video only)</label>
-    <select id="stemSelect">
-      <option value="auto">Auto — vocals + lead instrument</option>
-      <option value="vocals">Vocals only</option>
-      <option value="instrument">Lead instrument only (no vocals)</option>
-      <option value="bass">Bass line</option>
-      <option value="full">Full mix (skip separation — use for solo recordings)</option>
-    </select>
   </div>
 
   <button class="start" id="startBtn" disabled>Start Processing</button>
@@ -254,7 +213,6 @@
   var fileInfo = document.getElementById("fileInfo");
   var fileName = document.getElementById("fileName");
   var removeFile = document.getElementById("removeFile");
-  var stemGroup = document.getElementById("stemGroup");
   var startBtn = document.getElementById("startBtn");
   var progressSection = document.getElementById("progressSection");
   var stepLabel = document.getElementById("stepLabel");
@@ -347,7 +305,6 @@
     startBtn.disabled = false;
     errorMsg.classList.remove("visible");
     downloads.classList.remove("visible");
-    stemGroup.style.display = allDocuments() ? "none" : "";
   }
 
   function clearFiles() {
@@ -356,7 +313,6 @@
     document.getElementById("fileNamesList").textContent = "";
     fileInfo.classList.remove("visible");
     startBtn.disabled = true;
-    stemGroup.style.display = "";
   }
 
   function formatSize(bytes) {
@@ -379,18 +335,17 @@
     for (var i = 0; i < selectedFiles.length; i++) {
       form.append("file", selectedFiles[i]);
     }
-    form.append("stem", document.getElementById("stemSelect").value);
 
     fetch("/upload", { method: "POST", body: form })
       .then(function (r) { return r.json(); })
       .then(function (data) {
         if (data.error) throw new Error(data.error);
-        pollStatus(data.job_id, data.base_name, data.mode);
+        pollStatus(data.job_id);
       })
       .catch(showError);
   });
 
-  function pollStatus(jobId, baseName, mode) {
+  function pollStatus(jobId) {
     var interval = setInterval(function () {
       fetch("/status?job_id=" + jobId)
         .then(function (r) { return r.json(); })
@@ -414,9 +369,7 @@
 
   var FILE_DESCRIPTIONS = {
     ".musicxml": "open in MuseScore / Dorico",
-    ".mid":      "MIDI file",
-    ".json":     "tempo, duration, etc.",
-    ".pdf":      "searchable PDF with OCR",
+    ".pdf":      "PDF",
   };
 
   function showDownloads(jobId, outputFiles, message) {

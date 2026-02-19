@@ -1,4 +1,4 @@
-"""Flask app — upload, transcribe / process images, download."""
+"""Flask app — upload images or PDF, generate PDF and extract scores."""
 
 import os
 import threading
@@ -7,8 +7,11 @@ from pathlib import Path
 
 from flask import Flask, jsonify, request, send_from_directory
 
-from app.pipeline import run as run_audio_pipeline
-from app.image_pipeline import run as run_image_pipeline, IMAGE_EXTENSIONS, is_pdf
+from app.image_pipeline import (
+    IMAGE_EXTENSIONS,
+    is_pdf,
+    run as run_image_pipeline,
+)
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 
@@ -18,12 +21,8 @@ OUTPUT_ROOT = Path(os.environ.get("OUTPUT_DIR", "/tmp/transcriber"))
 _jobs: dict[str, dict] = {}
 _lock = threading.Lock()
 
-AUDIO_EXTENSIONS = {
-    ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma",
-    ".mp4", ".mkv", ".mov", ".avi", ".webm",
-}
 PDF_EXTENSIONS = {".pdf"}
-ALLOWED_EXTENSIONS = AUDIO_EXTENSIONS | IMAGE_EXTENSIONS | PDF_EXTENSIONS
+ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | PDF_EXTENSIONS
 
 
 @app.route("/")
@@ -31,8 +30,27 @@ def index():
     return send_from_directory(app.static_folder, "index.html")
 
 
+@app.route("/api/ocr-status")
+def ocr_status():
+    """Return OCR/tessdata setup so you can verify lyrics support (e.g. TESSDATA_PREFIX, legacy data)."""
+    prefix = os.environ.get("TESSDATA_PREFIX", "")
+    tessdata_dir = Path(prefix) / "tessdata" if prefix else None
+    exists = tessdata_dir is not None and tessdata_dir.is_dir()
+    files = []
+    if exists:
+        try:
+            files = [f.name for f in tessdata_dir.iterdir() if f.suffix == ".traineddata"]
+        except OSError:
+            pass
+    return jsonify(
+        TESSDATA_PREFIX=prefix or None,
+        tessdata_dir=str(tessdata_dir) if tessdata_dir else None,
+        tessdata_exists=exists,
+        traineddata_files=sorted(files)[:20],
+    )
+
+
 def _extension_or_heic_from_file(f) -> str:
-    """Return allowed extension from filename, or .heic from MIME type for HEIC/HEIF."""
     ext = (Path(f.filename).suffix or "").strip().lower()
     if ext and ext in ALLOWED_EXTENSIONS:
         return ext
@@ -51,9 +69,6 @@ def upload():
     first_ext = _extension_or_heic_from_file(files[0])
     if first_ext not in ALLOWED_EXTENSIONS:
         return jsonify(error=f"Unsupported file type: {first_ext or 'unknown'}"), 400
-
-    mode = "image" if (first_ext in IMAGE_EXTENSIONS or first_ext in PDF_EXTENSIONS) else "audio"
-    stem = request.form.get("stem", "auto")
 
     job_id = uuid.uuid4().hex[:12]
     job_dir = OUTPUT_ROOT / job_id
@@ -78,20 +93,23 @@ def upload():
 
     with _lock:
         _jobs[job_id] = {
-            "status": "queued", "step": "", "progress": 0,
-            "error": None, "base_name": base_name, "mode": mode,
-            "output_type": None, "output_files": [],
+            "status": "queued",
+            "step": "",
+            "progress": 0,
+            "error": None,
+            "base_name": base_name,
+            "output_files": [],
+            "message": None,
         }
 
     t = threading.Thread(
         target=_run_job,
-        args=(job_id, saved_paths, str(job_dir), stem,
-              original_names, base_name, mode),
+        args=(job_id, saved_paths, str(job_dir), original_names, base_name),
     )
     t.daemon = True
     t.start()
 
-    return jsonify(job_id=job_id, base_name=base_name, mode=mode)
+    return jsonify(job_id=job_id, base_name=base_name)
 
 
 @app.route("/status")
@@ -106,7 +124,7 @@ def status():
 
 @app.route("/download/<job_id>/<filename>")
 def download(job_id, filename):
-    if not filename.endswith((".mid", ".musicxml", ".json", ".pdf")):
+    if not filename.endswith((".musicxml", ".pdf")):
         return jsonify(error="Invalid file type"), 400
     job_dir = OUTPUT_ROOT / job_id
     path = job_dir / filename
@@ -115,8 +133,8 @@ def download(job_id, filename):
     return send_from_directory(str(job_dir), filename, as_attachment=True)
 
 
-def _run_job(job_id: str, paths: list[str], work_dir: str, stem: str,
-             original_names: list[str], base_name: str, mode: str):
+def _run_job(job_id: str, paths: list[str], work_dir: str,
+             original_names: list[str], base_name: str):
     def on_progress(step, pct):
         with _lock:
             _jobs[job_id].update(status="processing", step=step, progress=pct)
@@ -125,33 +143,18 @@ def _run_job(job_id: str, paths: list[str], work_dir: str, stem: str,
         with _lock:
             _jobs[job_id]["status"] = "processing"
 
-        if mode == "image":
-            result = run_image_pipeline(
-                paths, work_dir,
-                base_name=base_name, on_progress=on_progress,
+        result = run_image_pipeline(
+            paths, work_dir,
+            base_name=base_name, on_progress=on_progress,
+        )
+        with _lock:
+            _jobs[job_id].update(
+                status="done",
+                progress=100,
+                step="Done",
+                output_files=result["files"],
+                message=result.get("message"),
             )
-            with _lock:
-                _jobs[job_id].update(
-                    status="done", progress=100, step="Done",
-                    output_type="image",
-                    output_files=result["files"],
-                    message=result.get("message"),
-                )
-        else:
-            run_audio_pipeline(
-                paths[0], work_dir, stem=stem,
-                original_name=original_names[0], on_progress=on_progress,
-            )
-            with _lock:
-                _jobs[job_id].update(
-                    status="done", progress=100, step="Done",
-                    output_type="transcription",
-                    output_files=[
-                        f"{base_name}.musicxml",
-                        f"{base_name}.mid",
-                        f"{base_name}.json",
-                    ],
-                )
     except Exception as e:
         with _lock:
             _jobs[job_id].update(status="error", error=str(e))

@@ -1,0 +1,4 @@
+# Development and testing (install with: pip install -r requirements-dev.txt)
+-r requirements.txt
+pytest>=7,<9
+pytest-timeout>=2,<3

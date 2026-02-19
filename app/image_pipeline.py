@@ -1,33 +1,30 @@
 """
-Image / PDF processing pipeline.
+Image / PDF pipeline: generate PDF from images and extract scores to MusicXML.
 
 Accepts either:
-  A) One or more image files (sorted by filename), or
+  A) One or more image files (sorted by stem), or
   B) A single PDF file.
 
 Steps:
-  1. Produce a searchable PDF:
-     - For images: combine into one PDF with OCR text layers.
-     - For PDF input: keep the original PDF as-is.
-  2. Extract page images (from PDF input, or use the uploaded images).
-  3. Preprocess images — auto-rotate, deskew, perspective correction.
-  4. Split pages that contain multiple pieces (detected by text between
-     score sections — e.g. a new title between two scores).
-  5. Run OMR (oemer) on each section.
-  6. Group sections into pieces using final-barline detection:
-     - A section whose score ends with a final barline = piece ends.
-     - No final barline = piece continues into the next section.
-  7. Produce one MusicXML file per piece, merging multi-page pieces.
+  1. PDF: For images → combine into one PDF. For PDF input → keep as-is.
+  2. Extract page images (from PDF) or use uploaded images.
+  3. Preprocess (deskew, perspective). Resize for speed.
+  4. Run OMR (Audiveris) per page.
+  5. Group by final barlines; merge multi-page pieces.
+  6. Output one MusicXML per piece.
 
 Output:
-  - {base_name}.pdf                   — always produced
-  - {base_name}.musicxml              — if exactly one piece found
-  - {base_name}_1.musicxml, _2, …     — if multiple pieces found
+  - {base_name}.pdf
+  - {base_name}.musicxml (or _1, _2, …)
 """
 
 import logging
+import os
+import re
 import shutil
 import subprocess
+import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 
 import cv2
@@ -47,16 +44,14 @@ IMAGE_EXTENSIONS = {
     ".heic", ".heif",
 }
 
-MIN_GAP_HEIGHT = 30
-MIN_TITLE_CHARS = 3
-
 # Skew angles beyond this (degrees) are corrected; smaller is noise.
 MIN_SKEW_ANGLE = 0.5
 MAX_SKEW_ANGLE = 15.0
 
-# Max long edge (px) for the whole pipeline (resize → preprocess → PDF/OCR → OMR).
-# Lower = faster; 1200 is a good balance for one-page speed vs quality.
-MAX_WORKING_LONG_EDGE = 1200
+# Max long edge (px) for the whole pipeline (resize → preprocess → PDF → OMR).
+# Audiveris needs sufficient resolution (e.g. ~300 DPI equivalent) or it flags "no staves / resolution too low"
+# and may not run export; 2400 gives a better chance of completing transcription and getting .mxl.
+MAX_WORKING_LONG_EDGE = 2400
 
 
 def is_image(path: str) -> bool:
@@ -163,31 +158,8 @@ def _preprocess_image(image_path: Path, work_dir: Path, *,
 
 
 def _auto_rotate(img_cv: np.ndarray, image_path: Path) -> tuple[np.ndarray, bool]:
-    """Detect page orientation with Tesseract OSD and rotate if needed."""
-    import pytesseract
-
-    try:
-        pil_img = Image.open(str(image_path))
-        osd = pytesseract.image_to_osd(pil_img, output_type=pytesseract.Output.DICT)
-        angle = osd.get("rotate", 0)
-        if angle == 0:
-            return img_cv, False
-
-        log.info("OSD detected rotation: %d°", angle)
-
-        # OpenCV rotates counter-clockwise; Tesseract reports the angle
-        # the image needs to be rotated to be upright.
-        if angle == 90:
-            return cv2.rotate(img_cv, cv2.ROTATE_90_COUNTERCLOCKWISE), True
-        elif angle == 180:
-            return cv2.rotate(img_cv, cv2.ROTATE_180), True
-        elif angle == 270:
-            return cv2.rotate(img_cv, cv2.ROTATE_90_CLOCKWISE), True
-
-        return img_cv, False
-    except Exception as e:
-        log.debug("OSD rotation detection failed: %s", e)
-        return img_cv, False
+    """Placeholder: no OCR-based rotation. Returns image unchanged."""
+    return img_cv, False
 
 
 def _deskew(img_cv: np.ndarray) -> tuple[np.ndarray, bool]:
@@ -381,15 +353,17 @@ def run(image_paths: list[str], work_dir: str, *, base_name: str = "images",
         clean = _preprocess_image(img_path, work, page_idx=i)
         clean_paths.append(clean)
 
-    # --- For image input: create searchable PDF from preprocessed (straightened) pages ---
+    # --- For image input: create PDF from preprocessed pages ---
     if not pdf_inputs:
         _progress("Creating PDF", 42)
-        _images_to_searchable_pdf(clean_paths, pdf_path, _progress)
+        _images_to_pdf(clean_paths, pdf_path, _progress)
         output_files.append(pdf_path.name)
 
     # --- Split pages that contain multiple pieces, then OMR ---
     score_sections: list[tuple[int, Path]] = []
     seq = 0
+    last_omr_failure: str = ""
+    no_lyrics_any = False
 
     for i, img_path in enumerate(clean_paths):
         page_label = f"page {i + 1}/{n}" if n > 1 else "image"
@@ -407,7 +381,21 @@ def run(image_paths: list[str], work_dir: str, *, base_name: str = "images",
             _progress(f"OMR on {sec_label}", pct_base + 2)
 
             mxml = work / f"_omr_p{i + 1}_s{sec_idx}.musicxml"
-            if _try_omr(sec_path, mxml):
+            ok = False
+            reason = ""
+            if _audiveris_available():
+                ok, reason = _try_audiveris(sec_path, mxml)
+                if not ok:
+                    last_omr_failure = reason
+                elif reason == "no_lyrics":
+                    no_lyrics_any = True
+                    # Audiveris did not attach lyrics; run Tesseract on the image and inject into MusicXML
+                    if _inject_lyrics_from_image(sec_path, mxml):
+                        no_lyrics_any = False
+            else:
+                if not ok:
+                    last_omr_failure = "Audiveris not available (use amd64 image: build/run with --platform linux/amd64)"
+            if ok:
                 score_sections.append((seq, mxml))
                 found_any = True
                 log.info("Score found in %s", sec_label)
@@ -426,9 +414,14 @@ def run(image_paths: list[str], work_dir: str, *, base_name: str = "images",
         for p in work_resized_temps:
             p.unlink(missing_ok=True)
         _progress("Done", 100)
+        msg = "No scores were detected."
+        if last_omr_failure:
+            msg += " Last OMR reason: " + last_omr_failure
+        else:
+            msg += " Single-line percussion and non-standard staves may not be supported."
         return {
             "files": output_files,
-            "message": "No scores were detected. Single-line percussion (e.g. snare drum) and non-standard staves may not be supported by the OMR engine.",
+            "message": msg,
         }
 
     # --- Step 3: Group sections into pieces using final barlines ---
@@ -450,11 +443,11 @@ def run(image_paths: list[str], work_dir: str, *, base_name: str = "images",
             piece_name = f"{base_name}_{piece_idx}.musicxml"
 
         piece_path = work / piece_name
+        title = base_name if single_piece else f"{base_name} ({piece_idx})"
 
         if len(section_mxmls) == 1:
-            shutil.copy2(str(section_mxmls[0]), str(piece_path))
+            _write_musicxml_with_title(section_mxmls[0], piece_path, title=title)
         else:
-            title = base_name if single_piece else f"{base_name} ({piece_idx})"
             _merge_musicxml(section_mxmls, piece_path, title=title)
 
         output_files.append(piece_path.name)
@@ -473,7 +466,13 @@ def run(image_paths: list[str], work_dir: str, *, base_name: str = "images",
         p.unlink(missing_ok=True)
 
     _progress("Done", 100)
-    return {"files": output_files}
+    out = {"files": output_files}
+    if no_lyrics_any:
+        out["message"] = (
+            "No lyrics were detected in the score. "
+            "Audiveris expects lyrics below the staves; ensure the image resolution is sufficient (e.g. 300 DPI) and that OCR is configured (TESSDATA_PREFIX with chi_sim+eng)."
+        )
+    return out
 
 
 # ------------------------------------------------------------------
@@ -482,88 +481,8 @@ def run(image_paths: list[str], work_dir: str, *, base_name: str = "images",
 
 def _split_page(image_path: Path, work_dir: Path, *,
                 page_idx: int = 0) -> list[Path]:
-    """Split a page image into separate piece sections.
-
-    Uses horizontal projection to find gaps between score systems,
-    then runs OCR on each gap.  Gaps that contain text (a new title)
-    mark piece boundaries.  Returns a list of image paths — the
-    original if no split is needed, or cropped section images.
-    """
-    import pytesseract
-
-    img = Image.open(str(image_path))
-    gray = img.convert("L")
-    pixels = np.array(gray)
-    h, w = pixels.shape
-
-    # Count "ink" pixels per row (darker than threshold)
-    ink_per_row = np.sum(pixels < 180, axis=1)
-    quiet_threshold = w * 0.01  # less than 1% of width has ink = quiet row
-
-    # Find contiguous quiet regions (gaps between systems)
-    gaps: list[tuple[int, int]] = []
-    in_gap = False
-    gap_start = 0
-    for row in range(h):
-        if ink_per_row[row] <= quiet_threshold:
-            if not in_gap:
-                gap_start = row
-                in_gap = True
-        else:
-            if in_gap:
-                gap_h = row - gap_start
-                if gap_h >= MIN_GAP_HEIGHT:
-                    gaps.append((gap_start, row))
-                in_gap = False
-
-    if not gaps:
-        return [image_path]
-
-    # Check each gap for text (a piece title between two scores)
-    split_rows: list[int] = []
-    for gap_top, gap_bottom in gaps:
-        # Skip gaps at the very top or bottom of the page
-        if gap_top < h * 0.05 or gap_bottom > h * 0.95:
-            continue
-
-        # Crop the gap region with a small margin
-        margin = 5
-        crop_top = max(0, gap_top - margin)
-        crop_bottom = min(h, gap_bottom + margin)
-        gap_img = gray.crop((0, crop_top, w, crop_bottom))
-
-        try:
-            text = pytesseract.image_to_string(
-                gap_img, lang="chi_sim+chi_tra+eng",
-            ).strip()
-        except Exception:
-            text = ""
-
-        clean = text.replace(" ", "").replace("\n", "").replace("\t", "")
-        if len(clean) >= MIN_TITLE_CHARS:
-            mid = (gap_top + gap_bottom) // 2
-            split_rows.append(mid)
-            log.info("Page %d: title detected in gap y=%d–%d: '%s'",
-                     page_idx + 1, gap_top, gap_bottom,
-                     text.replace("\n", " ")[:60])
-
-    if not split_rows:
-        return [image_path]
-
-    # Crop into sections
-    y_starts = [0] + split_rows
-    y_ends = split_rows + [h]
-    sections: list[Path] = []
-
-    for sec_idx, (y0, y1) in enumerate(zip(y_starts, y_ends)):
-        if y1 - y0 < MIN_GAP_HEIGHT * 2:
-            continue  # too thin to contain a score
-        section = img.crop((0, y0, w, y1))
-        sec_path = work_dir / f"_crop_p{page_idx + 1}_s{sec_idx}.png"
-        section.save(str(sec_path))
-        sections.append(sec_path)
-
-    return sections if sections else [image_path]
+    """Return the page as a single section (no splitting)."""
+    return [image_path]
 
 
 # ------------------------------------------------------------------
@@ -626,138 +545,591 @@ def _group_into_pieces(
 
 
 # ------------------------------------------------------------------
-# PDF creation
+# PDF creation (images → single PDF, no OCR)
 # ------------------------------------------------------------------
 
-def _images_to_searchable_pdf(image_paths: list[Path], output_path: Path,
-                              _progress):
-    """Combine images into a single searchable PDF using Tesseract.
-
-    Each page gets an OCR text layer (Chinese + English) so the PDF
-    is searchable, while the original image is preserved visually.
-    """
-    import pytesseract
-
-    if len(image_paths) == 1:
-        _progress("Running OCR on image", 10)
-        img = Image.open(str(image_paths[0])).convert("RGB")
-        pdf_bytes = pytesseract.image_to_pdf_or_hocr(
-            img, lang="chi_sim+chi_tra+eng", extension="pdf",
-        )
-        output_path.write_bytes(pdf_bytes)
-        return
-
-    page_pdfs: list[Path] = []
-    for i, p in enumerate(image_paths):
-        _progress(f"OCR page {i + 1}/{len(image_paths)}", 10 + int(25 * i / len(image_paths)))
-        img = Image.open(str(p)).convert("RGB")
-        page_path = output_path.parent / f"_ocr_page_{i}.pdf"
-        pdf_bytes = pytesseract.image_to_pdf_or_hocr(
-            img, lang="chi_sim+chi_tra+eng", extension="pdf",
-        )
-        page_path.write_bytes(pdf_bytes)
-        page_pdfs.append(page_path)
-
-    _progress("Merging PDF pages", 35)
-    _merge_pdfs(page_pdfs, output_path)
-
-    for p in page_pdfs:
-        p.unlink(missing_ok=True)
-
-
-def _merge_pdfs(input_paths: list[Path], output_path: Path):
-    """Merge multiple single-page PDFs into one multi-page PDF."""
-    try:
-        from PyPDF2 import PdfMerger
-        merger = PdfMerger()
-        for p in input_paths:
-            merger.append(str(p))
-        merger.write(str(output_path))
-        merger.close()
-        return
-    except ImportError:
-        pass
-
-    log.warning("PyPDF2 not installed; using image-only PDF fallback")
+def _images_to_pdf(image_paths: list[Path], output_path: Path, _progress):
+    """Combine images into a single PDF (image-only, not searchable)."""
     images = []
-    for p in input_paths:
-        img = Image.open(str(p))
-        if img.mode in ("RGBA", "P"):
-            img = img.convert("RGB")
+    for i, p in enumerate(image_paths):
+        _progress(f"Adding page {i + 1}/{len(image_paths)} to PDF", 10 + int(25 * i / max(len(image_paths), 1)))
+        img = Image.open(str(p)).convert("RGB")
         images.append(img)
+    if not images:
+        return
     first = images[0]
     first.save(str(output_path), "PDF", resolution=150, save_all=True,
                append_images=images[1:])
 
 
 # ------------------------------------------------------------------
-# OMR
+# OMR — Audiveris (x86_64 only)
 # ------------------------------------------------------------------
 
-def _try_omr(image_path: Path, output_path: Path) -> bool:
-    """Run oemer on a single image.  Returns True if valid MusicXML produced.
-    Images larger than MAX_WORKING_LONG_EDGE are downscaled first to keep runtime reasonable.
-    """
+def _audiveris_available() -> bool:
+    """True if Audiveris binary is on PATH or in standard location."""
     try:
-        work_dir = output_path.parent
-        omr_input = image_path
-        img = Image.open(str(image_path))
-        w, h = img.size
-        if w > MAX_WORKING_LONG_EDGE or h > MAX_WORKING_LONG_EDGE:
-            img = _resize_by_long_edge(img, MAX_WORKING_LONG_EDGE)
-            omr_input = work_dir / f"_omr_in_{output_path.stem}.png"
-            img.save(str(omr_input), "PNG")
-            log.info("Downscaled to %dx%d for OMR", img.width, img.height)
+        r = subprocess.run(
+            ["Audiveris", "-help"],
+            capture_output=True,
+            timeout=5,
+        )
+        return r.returncode == 0 or b"Audiveris" in (r.stdout or b"") + (r.stderr or b"")
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
 
+
+def _tesseract_langs_available(prefix: str) -> bool:
+    """True if tesseract --list-langs with TESSDATA_PREFIX lists chi_sim or eng (OCR for lyrics)."""
+    try:
+        r = subprocess.run(
+            ["tesseract", "--list-langs"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={**os.environ, "TESSDATA_PREFIX": prefix},
+        )
+        out = (r.stdout or "") + (r.stderr or "")
+        return "chi_sim" in out or "eng" in out
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _try_audiveris(image_path: Path, output_path: Path) -> tuple[bool, str]:
+    """Run Audiveris on a single image. Returns (True, "") or (False, reason).
+    Audiveris supports pitched and percussion notation (x86_64 only).
+    """
+    work_dir = output_path.parent
+    book_name = image_path.stem
+    out_book = work_dir / book_name
+    # Use absolute path so Audiveris has a clear output target (book folder = input stem).
+    abs_image = image_path.resolve()
+    abs_work = work_dir.resolve()
+
+    try:
+        # TESSDATA_PREFIX so Audiveris can run Tesseract OCR for lyrics (TEXTS step).
+        # Prefer /opt/audiveris-tessdata (legacy 4.0 traineddata); apt tessdata is LSTM-only and Audiveris needs legacy.
+        audiveris_env = os.environ.copy()
+        _tess_prefix = None
+        for prefix in ("/opt/audiveris-tessdata", "/usr/share/tesseract-ocr/5", "/usr/share/tesseract-ocr/4.00", "/usr/share/tesseract-ocr"):
+            if (Path(prefix) / "tessdata").exists():
+                _tess_prefix = prefix
+                audiveris_env["TESSDATA_PREFIX"] = prefix
+                break
+        if not _tess_prefix:
+            _tess_prefix = audiveris_env.get("TESSDATA_PREFIX")
+        if _tess_prefix:
+            log.info("Audiveris TESSDATA_PREFIX=%s (lyrics)", _tess_prefix)
+            if not _tesseract_langs_available(_tess_prefix):
+                log.warning(
+                    "tesseract --list-langs did not show chi_sim/eng; Audiveris may need legacy tessdata (e.g. /opt/audiveris-tessdata)"
+                )
+        else:
+            log.warning("No tessdata dir found; TEXTS/lyrics may be skipped")
+        # Set OCR language before -batch so it's applied at startup (TEXTS step needs it for lyrics).
+        # Some docs use -constant; we pass both in case the CLI accepts only one.
+        lang_opt = "org.audiveris.omr.text.Language.defaultSpecification=chi_sim+eng"
         result = subprocess.run(
-            ["oemer", str(omr_input)],
-            capture_output=True, text=True,
+            [
+                "xvfb-run", "-a",
+                "Audiveris",
+                "-option", lang_opt,
+                "-batch",
+                "-save",
+                "-transcribe",
+                "-export",
+                "-output", str(abs_work),
+                "--",
+                str(abs_image),
+            ],
+            capture_output=True,
+            text=True,
             cwd=str(work_dir),
             timeout=300,
+            env=audiveris_env,
         )
 
-        if omr_input != image_path:
-            omr_input.unlink(missing_ok=True)
+        out_txt = (result.stdout or "").strip()
+        err_txt = (result.stderr or "").strip()
+        err_msg = (err_txt or out_txt)[:800]
+        if out_txt:
+            log.info("Audiveris stdout: %s", out_txt[:1500])
+        if err_txt:
+            # Log full stderr to spot OCR/TEXTS errors (e.g. "Failed loading language", "Could not initialize Tesseract").
+            log.info("Audiveris stderr: %s", err_txt[:2000])
 
         if result.returncode != 0:
-            log.info("oemer exited %d: %s", result.returncode,
-                     result.stderr[:500])
-            return False
+            log.info("Audiveris exited %d: %s", result.returncode, err_msg[:500])
+            return False, f"Audiveris exit {result.returncode}: {err_msg[:400]}"
 
-        candidates = [f for f in work_dir.glob("*.musicxml")
-                      if not f.name.startswith("_")]
+        # Audiveris creates a subfolder under -output named from the input stem (e.g. _clean_p1).
+        candidates = list(out_book.glob("*.mxl")) + list(out_book.glob("*.xml")) if out_book.exists() else []
         if not candidates:
-            log.info("oemer produced no MusicXML output")
-            return False
+            candidates = [p for p in (list(work_dir.glob("*/*.mxl")) + list(work_dir.glob("*/*.xml"))) if not p.name.startswith("_")]
+        if not candidates:
+            for ext in ("*.mxl", "*.xml"):
+                candidates.extend(work_dir.rglob(ext))
+            candidates = [p for p in candidates if not p.name.startswith("_") and p.is_file()]
+        if candidates and out_book.exists():
+            in_book = [p for p in candidates if str(p).startswith(str(out_book))]
+            if in_book:
+                candidates = in_book + [p for p in candidates if p not in in_book]
 
-        omr_output = candidates[0]
-        if omr_output.resolve() != output_path.resolve():
-            shutil.move(str(omr_output), str(output_path))
+        # If transcribe produced .omr but no .mxl, run export separately.
+        if not candidates:
+            omr_files = list(work_dir.glob(f"{book_name}.omr")) or list(work_dir.glob("*.omr"))
+            if omr_files:
+                omr_path = omr_files[0].resolve()
+                log.info("Running Audiveris -export on %s", omr_path.name)
+                # Request uncompressed .xml so we have a single predictable output file.
+                # Pass .omr path relative to work_dir so Audiveris finds the book in the output folder.
+                omr_rel = omr_files[0].name
+                # Force baseFolder so export writes under work_dir (Audiveris may otherwise use default XDG_DATA_HOME).
+                env = os.environ.copy()
+                env["XDG_DATA_HOME"] = str(abs_work)
+                _tp = env.get("TESSDATA_PREFIX")
+                if not _tp or not (Path(_tp) / "tessdata").exists():
+                    for prefix in ("/opt/audiveris-tessdata", "/usr/share/tesseract-ocr/5", "/usr/share/tesseract-ocr/4.00", "/usr/share/tesseract-ocr"):
+                        if (Path(prefix) / "tessdata").exists():
+                            env["TESSDATA_PREFIX"] = prefix
+                            break
+                lang_opt = "org.audiveris.omr.text.Language.defaultSpecification=chi_sim+eng"
+                result2 = subprocess.run(
+                    [
+                        "xvfb-run", "-a",
+                        "Audiveris",
+                        "-option", lang_opt,
+                        "-batch",
+                        "-export",
+                        "-output", str(abs_work),
+                        "-option", "org.audiveris.omr.sheet.BookManager.baseFolder=" + str(abs_work),
+                        "-option", "org.audiveris.omr.sheet.BookManager.useCompression=false",
+                        "--",
+                        omr_rel,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(work_dir),
+                    timeout=120,
+                    env=env,
+                )
+                export_err = (result2.stderr or result2.stdout or "").strip()[:500]
+                if result2.stderr:
+                    log.info("Audiveris export stderr: %s", (result2.stderr or "")[:400])
+                # Search for any .mxl or .xml regardless of returncode (export may write then exit non-zero).
+                stem = omr_files[0].stem
+                for ext in ("*.mxl", "*.xml"):
+                    candidates.extend(work_dir.glob(ext))
+                    candidates.extend(work_dir.rglob(ext))
+                # Audiveris may write to work_dir/stem/stem.mxl, work_dir/stem.mxl, or XDG base (e.g. work_dir/AudiverisLtd/audiveris/...).
+                for f in (work_dir / stem / f"{stem}.mxl", work_dir / stem / f"{stem}.xml",
+                          work_dir / f"{stem}.mxl", work_dir / f"{stem}.xml"):
+                    if f.is_file():
+                        candidates.append(f.resolve())
+                audiveris_base = work_dir / "AudiverisLtd" / "audiveris"
+                if audiveris_base.exists():
+                    for f in audiveris_base.rglob("*.mxl"):
+                        if f.is_file():
+                            candidates.append(f.resolve())
+                    for f in audiveris_base.rglob("*.xml"):
+                        if f.is_file():
+                            candidates.append(f.resolve())
+                candidates = list({p.resolve() for p in candidates if p.is_file()})
+                if omr_files and candidates:
+                    stem = omr_files[0].stem
+                    by_stem = [p for p in candidates if p.stem == stem]
+                    if by_stem:
+                        candidates = by_stem + [p for p in candidates if p not in by_stem]
+                if not candidates and export_err:
+                    err_msg = export_err  # surface export error in final message
 
-        content = output_path.read_text(encoding="utf-8", errors="replace")
+        if not candidates:
+            # Surface Audiveris output so user can see why no file was produced.
+            detail = err_msg[:350].strip() or " (no stderr/stdout)"
+            try:
+                contents = list(work_dir.iterdir())
+                detail += "; work_dir contents: " + ", ".join(p.name for p in contents[:15])
+            except OSError:
+                pass
+            log.info("Audiveris produced no MusicXML output (book_dir=%s). %s", out_book, detail)
+            return False, "Audiveris produced no MusicXML output. " + detail
+
+        src = candidates[0]
+        if src.suffix.lower() == ".mxl":
+            with zipfile.ZipFile(src, "r") as z:
+                names = [n for n in z.namelist() if n.lower().endswith(".xml")]
+                if not names:
+                    return False, "Audiveris MXL had no XML"
+                content = z.read(names[0]).decode("utf-8", errors="replace")
+        else:
+            content = src.read_text(encoding="utf-8", errors="replace")
+
         lower = content.lower()
-        # Accept both pitched notes and percussion (unpitched) so percussion output isn't rejected
         if "<note" not in lower and "<unpitched" not in lower:
-            log.info("oemer MusicXML has no note/unpitched elements (single-line percussion may be unsupported)")
-            output_path.unlink(missing_ok=True)
-            return False
-
-        return True
+            log.info("Audiveris output has no note/unpitched elements (percussion may need manual editing)")
+        has_lyrics = "<lyric" in lower
+        if not has_lyrics:
+            log.info("Audiveris output has no <lyric> elements (TEXTS/OCR may be skipped or lyrics not attached)")
+        output_path.write_text(content, encoding="utf-8")
+        if out_book.exists():
+            shutil.rmtree(out_book, ignore_errors=True)
+        return True, "" if has_lyrics else "no_lyrics"
 
     except subprocess.TimeoutExpired:
-        log.warning("oemer timed out after 5 min")
-        return False
+        log.warning("Audiveris timed out after 5 min")
+        return False, "Audiveris timed out"
     except FileNotFoundError:
-        log.warning("oemer binary not found — OMR unavailable")
-        return False
+        return False, "Audiveris not installed"
     except Exception as e:
-        log.warning("OMR failed: %s", e)
+        log.warning("Audiveris failed: %s", e)
+        return False, str(e)
+
+
+# ------------------------------------------------------------------
+# Lyric injection — Tesseract OCR on image, attach text to notes (workaround when Audiveris TEXTS gives no lyrics)
+# ------------------------------------------------------------------
+
+def _tessdata_prefix() -> str | None:
+    """Return TESSDATA_PREFIX if a tessdata dir exists (same order as Audiveris)."""
+    for prefix in ("/opt/audiveris-tessdata", "/usr/share/tesseract-ocr/5", "/usr/share/tesseract-ocr/4.00", "/usr/share/tesseract-ocr"):
+        if (Path(prefix) / "tessdata").exists():
+            return prefix
+    return os.environ.get("TESSDATA_PREFIX") or None
+
+
+def _inject_lyrics_from_image(image_path: Path, mxml_path: Path) -> bool:
+    """
+    Run Tesseract OCR on the sheet image and attach recognized text to notes in the MusicXML.
+    Used when Audiveris does not produce lyrics (TEXTS step skipped or not attached).
+    Assigns one character per note for Chinese-style lyrics; multiple parts get lines split by newline.
+    Returns True if any lyrics were added.
+    """
+    import music21
+
+    prefix = _tessdata_prefix()
+    env = os.environ.copy()
+    if prefix:
+        env["TESSDATA_PREFIX"] = prefix
+    try:
+        r = subprocess.run(
+            ["tesseract", str(image_path), "stdout", "-l", "chi_sim+eng", "--psm", "6"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+            cwd=str(image_path.parent),
+        )
+        text = (r.stdout or "").strip() if r.returncode == 0 else ""
+        # Also try stderr for some tesseract versions
+        if not text and r.stderr:
+            text = (r.stderr or "").strip()
+        if not text or not text.replace("\n", "").replace(" ", ""):
+            log.debug("Tesseract produced no text for %s", image_path.name)
+            return False
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log.debug("Tesseract not run for lyrics: %s", e)
         return False
 
+    try:
+        score = music21.converter.parse(str(mxml_path))
+    except Exception as e:
+        log.warning("Could not parse MusicXML for lyric injection: %s", e)
+        return False
+
+    # Collect note "slots" per part (one per Note or Chord, in order)
+    parts_slots: list[list] = []
+    for part in score.parts:
+        slots = list(part.flat.notes)  # Note and Chord objects in order
+        slots.sort(key=lambda n: n.getOffsetInHierarchy(score))
+        parts_slots.append(slots)
+
+    if not parts_slots or all(not s for s in parts_slots):
+        return False
+
+    # Split OCR text by newlines for multiple parts; otherwise use single block
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    if not lines:
+        lines = [text]
+    # One line per part, or repeat first line
+    while len(lines) < len(parts_slots):
+        lines.append(lines[0] if lines else "")
+
+    added = 0
+    for part_idx, slots in enumerate(parts_slots):
+        if not slots:
+            continue
+        line = lines[part_idx] if part_idx < len(lines) else lines[0]
+        # Remove spaces for Chinese; then assign one character per note
+        chars = [c for c in line if c.strip()] or list(line)
+        for i, n in enumerate(slots):
+            if i < len(chars):
+                n.lyric = chars[i]
+                added += 1
+
+    if not added:
+        return False
+    try:
+        score.write("musicxml", fp=str(mxml_path))
+        log.info("Injected %d lyric(s) from Tesseract into %s", added, mxml_path.name)
+    except Exception as e:
+        log.warning("Could not write MusicXML after lyric injection: %s", e)
+        return False
+    return True
+
 
 # ------------------------------------------------------------------
-# MusicXML merge — concatenate measures from multiple sections
+# MusicXML — set title, instrument (piano), and optionally merge
 # ------------------------------------------------------------------
+
+def _set_score_instrument_piano(score):
+    """Set every part in the score to Piano (so output is not vocal).
+    Remove any existing instrument (e.g. vocal), set part name, and insert Piano at offset 0."""
+    import music21
+    for part in score.parts:
+        for inst in part.getElementsByClass(music21.instrument.Instrument):
+            part.remove(inst)
+        piano = music21.instrument.Piano()
+        part.instrument = piano
+        part.partName = "Piano"
+        part.insert(0, piano)
+
+
+def _write_musicxml_with_title(source_path: Path, output_path: Path, *, title: str):
+    """Parse one MusicXML file, set work title and instrument to piano, and write to output_path."""
+    import music21
+
+    try:
+        s = music21.converter.parse(str(source_path))
+        if s.metadata is None:
+            s.metadata = music21.metadata.Metadata()
+        s.metadata.title = title
+        s.metadata.movementName = title
+        _set_score_instrument_piano(s)
+        _fix_clefs_at_end_of_measure(s)
+        _fill_measure_number_gaps(s)
+        s.write("musicxml", fp=str(output_path))
+        # Post-pass: move clefs that ended up at end of measure in XML to start of measure
+        try:
+            xml = output_path.read_text(encoding="utf-8")
+            output_path.write_text(_move_clefs_from_end_to_start_of_measure_xml(xml), encoding="utf-8")
+        except Exception as e:
+            log.warning("Clef post-pass failed for %s: %s", output_path.name, e)
+    except Exception as e:
+        log.warning("Could not set title on %s: %s; copying as-is", source_path.name, e)
+        shutil.copy2(str(source_path), str(output_path))
+
+
+def _count_measures_per_part(score) -> list[int]:
+    """Return list of measure counts per part (for verification)."""
+    import music21
+    return [
+        len(list(part.getElementsByClass(music21.stream.Measure)))
+        for part in score.parts
+    ]
+
+
+def _local_tag(el: ET.Element) -> str:
+    """Return tag name without namespace (MusicXML uses default ns)."""
+    return el.tag.split("}")[-1] if "}" in el.tag else el.tag
+
+
+def _attributes_has_clef(attr_el: ET.Element) -> bool:
+    """True if this <attributes> element contains a <clef> child."""
+    return attr_el.find(".//{*}clef") is not None or attr_el.find(".//clef") is not None
+
+
+def _move_clefs_from_end_to_start_of_measure_xml(xml_content: str) -> str:
+    """MusicXML post-pass: move <attributes> blocks that contain <clef> and appear after
+    a note/rest to the start of that measure (clef must be inside <attributes>)."""
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError as e:
+        log.warning("Clef post-pass: could not parse MusicXML: %s", e)
+        return xml_content
+    # MusicXML 3.0 uses default ns; 2.0 may use partwise ns or no ns
+    ns = {"m": "http://www.musicxml.org/ns/3.0", "p": "http://www.musicxml.org/ns/partwise"}
+    parts = (
+        list(root.iterfind(".//m:part", ns))
+        or list(root.iterfind(".//p:part", ns))
+        or list(root.iterfind(".//{*}part"))
+        or [e for e in root.iter() if _local_tag(e) == "part"]
+    )
+    if not parts:
+        parts = [root]
+    moved_count = 0
+    for part in parts:
+        for measure in list(part):
+            if _local_tag(measure) != "measure":
+                continue
+            children = list(measure)
+            first_note_idx = None
+            for i, child in enumerate(children):
+                if _local_tag(child) == "note":
+                    first_note_idx = i
+                    break
+            if first_note_idx is None:
+                continue
+            to_move = []
+            for i, child in enumerate(children):
+                if _local_tag(child) != "attributes":
+                    continue
+                if not _attributes_has_clef(child):
+                    continue
+                if i > first_note_idx:
+                    to_move.append((i, child))
+            if not to_move:
+                continue
+            insert_idx = 0
+            for i in range(first_note_idx):
+                if _local_tag(children[i]) == "attributes":
+                    insert_idx = i + 1
+            for i, el in sorted(to_move, reverse=True):
+                measure.remove(el)
+                moved_count += 1
+            for el in [el for _, el in to_move]:
+                measure.insert(insert_idx, el)
+                insert_idx += 1
+    if moved_count:
+        log.info("Clef post-pass: moved %d attributes-with-clef from end to start of measure", moved_count)
+    out = ET.tostring(root, encoding="unicode", default_namespace="http://www.musicxml.org/ns/3.0")
+    if xml_content.lstrip().startswith("<?xml"):
+        decl = xml_content[: xml_content.find("?>") + 2]
+        if not out.lstrip().startswith("<?xml"):
+            out = decl + "\n" + out
+    return out
+
+
+def _fix_clefs_at_end_of_measure(score):
+    """Move any clef that appears at the end of a measure to the start of the next measure.
+    If there is no next measure (OMR dropped it), insert a rest measure and put the clef there.
+    This fixes wrong MusicXML where treble clefs appear at the end of measures."""
+    import music21
+    for part in score.parts:
+        measures = list(part.getElementsByClass(music21.stream.Measure))
+        if not measures:
+            continue
+        measures.sort(key=lambda m: m.getOffsetInHierarchy(part))
+
+        # Collect (measure, clef) where clef is misplaced (at end of measure).
+        # Detect by: clef offset > 0, OR clef is not the first element in the measure (there are notes before it).
+        to_move = []
+        for m in measures:
+            clefs = list(m.getElementsByClass(music21.clef.Clef))
+            for clef in clefs:
+                try:
+                    off = m.elementOffset(clef) if hasattr(m, "elementOffset") else clef.getOffsetBySite(m)
+                except Exception:
+                    off = getattr(clef, "offset", 0)
+                m_len = m.quarterLength or 4.0
+                # Clef at end: either offset in second half, or offset > 0 (not at start)
+                if off >= 0.5 * m_len:
+                    to_move.append((m, clef))
+                    continue
+                # Also: if in stream order a note/rest appears before this clef, the clef is at the end (wrong)
+                seen_note_or_rest_before_clef = False
+                for el in m.iter:
+                    if el is clef:
+                        if seen_note_or_rest_before_clef:
+                            to_move.append((m, clef))
+                        break
+                    if isinstance(el, (music21.note.Note, music21.note.Rest, music21.chord.Chord)):
+                        seen_note_or_rest_before_clef = True
+
+        for m, clef in to_move:
+            try:
+                m.remove(clef)
+            except Exception:
+                continue
+            m_offset = m.getOffsetInHierarchy(part)
+            m_end = m_offset + m.quarterLength
+            # Find next measure (start offset >= m_end, smallest first)
+            next_measure = None
+            for other in measures:
+                other_off = other.getOffsetInHierarchy(part)
+                if other_off >= m_end - 0.001:
+                    next_measure = other
+                    break
+            if next_measure is not None:
+                next_measure.insert(0, clef)
+            else:
+                # No next measure: insert a rest measure and put clef at start
+                new_m = music21.stream.Measure()
+                new_m.insert(0, clef)
+                new_m.append(music21.note.Rest(quarterLength=m.quarterLength))
+                part.insert(m_end, new_m)
+                measures.append(new_m)
+                measures.sort(key=lambda x: x.getOffsetInHierarchy(part))
+
+
+def _is_repeat_barline(measure) -> bool:
+    """True if measure has a repeat-style right barline."""
+    rb = getattr(measure, "rightBarline", None)
+    if rb is None:
+        return False
+    t = getattr(rb, "type", None) or ""
+    return t in ("light-heavy", "heavy-light", "heavy-light-heavy") or "repeat" in str(t).lower()
+
+
+def _measure_has_notes(measure) -> bool:
+    """True if measure contains at least one Note or Chord."""
+    import music21
+    return bool(measure.getElementsByClass(music21.note.Note)) or bool(
+        measure.getElementsByClass(music21.chord.Chord)
+    )
+
+
+def _fill_measure_number_gaps(score):
+    """Insert rest measures so numbering is continuous and so a missing measure before a repeat is filled.
+
+    1) Numerical gaps: if measure numbers jump (e.g. 21 then 23), insert rest measure(s).
+    2) Repeat heuristic: if a measure has a repeat barline and is empty/short (OMR often drops the measure
+       before a repeat), insert one full rest measure before it.
+    """
+    import music21
+    for part in score.parts:
+        measures = list(part.getElementsByClass(music21.stream.Measure))
+        if not measures:
+            continue
+        measures.sort(key=lambda m: m.getOffsetInHierarchy(part))
+
+        # Typical measure length (median of non-zero lengths) for repeat heuristic
+        lengths = [m.quarterLength for m in measures if m.quarterLength > 0]
+        typical_q = lengths[len(lengths) // 2] if lengths else 4.0
+
+        inserts = []
+
+        # 1) Numerical gaps
+        for i in range(len(measures) - 1):
+            prev_m = measures[i]
+            next_num = measures[i + 1].number
+            for missing in range(measures[i].number + 1, next_num):
+                insert_offset = prev_m.offset + prev_m.quarterLength * (missing - measures[i].number)
+                inserts.append((insert_offset, prev_m.quarterLength))
+
+        # 2) Measure before repeat that looks missing (repeat barline but no/short content)
+        for m in measures:
+            if not _is_repeat_barline(m):
+                continue
+            q = m.quarterLength or 0
+            no_notes = not _measure_has_notes(m)
+            short = q < 0.5 * typical_q
+            if no_notes or short:
+                insert_offset = m.offset
+                inserts.append((insert_offset, typical_q))
+                break  # at most one insert per part for repeat heuristic
+
+        # Insert in descending offset order so earlier offsets are not shifted
+        for insert_offset, qlen in sorted(inserts, key=lambda x: -x[0]):
+            new_measure = music21.stream.Measure()
+            new_measure.append(music21.note.Rest(quarterLength=qlen))
+            part.insert(insert_offset, new_measure)
+
+        # Renumber 1..N
+        measures = list(part.getElementsByClass(music21.stream.Measure))
+        measures.sort(key=lambda m: m.getOffsetInHierarchy(part))
+        for j, m in enumerate(measures, 1):
+            m.number = j
+
 
 def _merge_musicxml(page_paths: list[Path], output_path: Path, *,
                     title: str = "Score"):
@@ -765,6 +1137,7 @@ def _merge_musicxml(page_paths: list[Path], output_path: Path, *,
 
     Pages are assumed to be in order.  Parts are matched by index
     (part 0 of page 2 appends to part 0 of page 1, etc.).
+    Verifies that no measures are dropped (logs warning if counts don't match).
     """
     import music21
 
@@ -781,10 +1154,21 @@ def _merge_musicxml(page_paths: list[Path], output_path: Path, *,
 
     base = scores[0]
 
+    # Expected total measures per part (sum across all pages)
+    n_parts = max(len(base.parts), 1)
+    expected_per_part: list[int] = [0] * n_parts
+    for s in scores:
+        counts = _count_measures_per_part(s)
+        for i, c in enumerate(counts):
+            while len(expected_per_part) <= i:
+                expected_per_part.append(0)
+            expected_per_part[i] += c
+
     if base.metadata is None:
         base.metadata = music21.metadata.Metadata()
     base.metadata.title = title
     base.metadata.movementName = title
+    _set_score_instrument_piano(base)
 
     base_parts = list(base.parts)
 
@@ -799,10 +1183,13 @@ def _merge_musicxml(page_paths: list[Path], output_path: Path, *,
             page_measures = list(
                 page_part.getElementsByClass(music21.stream.Measure),
             )
+            # Ensure chronological order (by offset) so no measure is skipped or duplicated
+            page_measures.sort(key=lambda m: m.getOffsetInHierarchy(page_part))
 
             existing = list(
                 base_part.getElementsByClass(music21.stream.Measure),
             )
+            existing.sort(key=lambda m: m.getOffsetInHierarchy(base_part))
             next_num = existing[-1].number + 1 if existing else 1
             last_offset = (
                 existing[-1].offset + existing[-1].quarterLength
@@ -816,11 +1203,32 @@ def _merge_musicxml(page_paths: list[Path], output_path: Path, *,
                 last_offset += m.quarterLength
 
     for part in base.parts:
-        for i, m in enumerate(
-            part.getElementsByClass(music21.stream.Measure), 1,
-        ):
+        measures = list(part.getElementsByClass(music21.stream.Measure))
+        measures.sort(key=lambda m: m.getOffsetInHierarchy(part))
+        for i, m in enumerate(measures, 1):
             m.number = i
 
+    # Verify no measures were dropped
+    actual_per_part = _count_measures_per_part(base)
+    for part_idx, (expected, actual) in enumerate(zip(expected_per_part, actual_per_part)):
+        if actual < expected:
+            log.warning(
+                "Merge: part %d has %d measures but expected %d (from %d page(s)); some measures may be missing",
+                part_idx + 1, actual, expected, len(scores),
+            )
+    if len(actual_per_part) < len(expected_per_part):
+        log.warning(
+            "Merge: output has %d parts but input had %d; extra part(s) may have been dropped",
+            len(actual_per_part), len(expected_per_part),
+        )
+
+    _fix_clefs_at_end_of_measure(base)
+    _fill_measure_number_gaps(base)
     base.write("musicxml", fp=str(output_path))
+    try:
+        xml = output_path.read_text(encoding="utf-8")
+        output_path.write_text(_move_clefs_from_end_to_start_of_measure_xml(xml), encoding="utf-8")
+    except Exception as e:
+        log.warning("Clef post-pass failed for merged %s: %s", output_path.name, e)
     log.info("Merged %d pages into %s (%d parts)",
              len(scores), output_path.name, len(base_parts))

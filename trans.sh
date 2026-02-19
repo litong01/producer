@@ -15,23 +15,20 @@ usage() {
     echo "  status                         Show container status"
     echo "  logs                           Tail container logs"
     echo "  build                          Build the Docker image"
+    echo "  test                           Run integration test (童年.pdf → MusicXML; requires 童年.pdf in repo)"
     echo "  run <file(s)> -o <dir> [opts]  CLI: process files without the web UI"
     echo
     echo "Supported inputs:"
-    echo "  Audio/Video  .mp3 .wav .flac .ogg .m4a .mp4 .mkv .mov .avi .webm"
-    echo "  Images       .jpg .jpeg .png .bmp .tiff .tif .gif .webp"
+    echo "  Images  .jpg .jpeg .png .bmp .tiff .tif .gif .webp .heic .heif"
+    echo "  PDF     .pdf"
     echo
     echo "CLI options (for 'run' command):"
     echo "  -o, --output DIR     Output directory (required)"
-    echo "  --stem MODE          auto | vocals | instrument | bass | full (default: auto)"
-    echo "                       (only applies to audio/video files)"
     echo
     echo "Examples:"
     echo "  $0 start                                      # web UI at http://localhost:8080"
-    echo "  $0 run song.mp4 -o ./out                      # transcribe audio"
-    echo "  $0 run score.png -o ./out                     # recognise music score"
-    echo "  $0 run photo.jpg -o ./out                     # OCR → PDF"
-    echo "  $0 run *.mp4 -o ./out --stem vocals           # batch, vocals only"
+    echo "  $0 run page1.png page2.png -o ./out           # images → PDF + MusicXML"
+    echo "  $0 run scores.pdf -o ./out                    # PDF → MusicXML"
     echo
     echo "Environment variables:"
     echo "  TRANSCRIBER_PORT    Port to expose (default: 8080)"
@@ -39,8 +36,8 @@ usage() {
 }
 
 do_build() {
-    echo "Building image ${IMAGE_NAME}..."
-    docker build -t "${IMAGE_NAME}" .
+    echo "Building image ${IMAGE_NAME} (amd64 for Audiveris)..."
+    docker build --platform linux/amd64 -t "${IMAGE_NAME}" .
     echo "Done."
 }
 
@@ -53,8 +50,9 @@ do_start() {
 
     docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
 
-    echo "Starting ${CONTAINER_NAME} on port ${PORT}..."
+    echo "Starting ${CONTAINER_NAME} on port ${PORT} (amd64 for Audiveris)..."
     docker run -d \
+        --platform linux/amd64 \
         --name "${CONTAINER_NAME}" \
         -p "${PORT}:8080" \
         "${IMAGE_NAME}"
@@ -89,6 +87,23 @@ do_logs() {
     docker logs -f "${CONTAINER_NAME}"
 }
 
+do_test() {
+    local repo_root
+    repo_root="$(cd "$(dirname "$0")" && pwd)"
+    if [[ ! -f "${repo_root}/童年.pdf" ]]; then
+        echo "Error: 童年.pdf not found in ${repo_root}. Place it there to run the integration test." >&2
+        exit 1
+    fi
+    echo "Running integration test (童年.pdf → pipeline → MusicXML with title)..."
+    docker run --rm \
+        --platform linux/amd64 \
+        -v "${repo_root}:/app:ro" \
+        -w /app \
+        -e PYTHONPATH=/app \
+        "${IMAGE_NAME}" \
+        bash -c "pip install -q -r requirements-dev.txt 2>/dev/null || true && pytest tests/ -m integration -v --timeout=600 -p no:cacheprovider"
+}
+
 do_run() {
     # Parse arguments: collect input files and pass-through flags
     local -a files=()
@@ -100,11 +115,6 @@ do_run() {
         case "$1" in
             -o|--output)
                 output_dir="$2"
-                shift 2
-                parsing_files=false
-                ;;
-            --stem)
-                cli_args+=(--stem "$2")
                 shift 2
                 parsing_files=false
                 ;;
@@ -150,6 +160,7 @@ do_run() {
     volumes+=(-v "${abs_output}:/output")
 
     docker run --rm \
+        --platform linux/amd64 \
         "${volumes[@]}" \
         "${IMAGE_NAME}" \
         python -m app.cli "${container_inputs[@]}" -o /output "${cli_args[@]}"
@@ -162,6 +173,7 @@ case "${1:-}" in
     status)  do_status ;;
     logs)    do_logs ;;
     build)   do_build ;;
+    test)    do_test ;;
     run)     shift; do_run "$@" ;;
     *)       usage ;;
 esac
